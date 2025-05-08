@@ -1,70 +1,106 @@
-;; Risk Assessment Contract
-;; This contract calculates appropriate interest rates
+;; Repayment Tracking Contract
+;; This contract manages loan servicing and collections
 
-(define-constant min-interest-rate u500) ;; 5.00%
-(define-constant max-interest-rate u3000) ;; 30.00%
-(define-constant base-interest-rate u1000) ;; 10.00%
-
-(define-map loan-risk-profiles uint {
+(define-map loans uint {
+  borrower: principal,
+  amount: uint,
   interest-rate: uint,
-  risk-score: uint,
-  loan-term: uint
+  term: uint,
+  start-block: uint,
+  end-block: uint,
+  total-repaid: uint,
+  status: (string-ascii 10)
 })
 
+(define-map repayments (tuple (loan-id uint) (payment-id uint)) {
+  amount: uint,
+  block-height: uint
+})
+
+(define-data-var next-payment-id uint u1)
 (define-constant contract-owner tx-sender)
 
-(define-read-only (get-risk-profile (loan-id uint))
-  (map-get? loan-risk-profiles loan-id)
+(define-read-only (get-loan (loan-id uint))
+  (map-get? loans loan-id)
 )
 
-(define-read-only (calculate-interest-rate (credit-score uint) (loan-amount uint) (loan-term uint))
-  (let (
-    (credit-factor (if (> credit-score u700)
-                      (- u1000 (* u500 (/ (- credit-score u700) u300)))
-                      (+ u1000 (* u1000 (/ (- u700 credit-score) u700)))))
-    (amount-factor (if (> loan-amount u10000)
-                      (+ u100 (* u200 (/ loan-amount u10000)))
-                      u100))
-    (term-factor (if (> loan-term u12)
-                    (+ u100 (* u50 (/ loan-term u12)))
-                    u100))
-    (calculated-rate (/ (* base-interest-rate (+ credit-factor amount-factor term-factor)) u300))
-  )
-    (if (< calculated-rate min-interest-rate)
-        min-interest-rate
-        (if (> calculated-rate max-interest-rate)
-            max-interest-rate
-            calculated-rate))
-  )
+(define-read-only (get-repayment (loan-id uint) (payment-id uint))
+  (map-get? repayments {loan-id: loan-id, payment-id: payment-id})
 )
 
-(define-public (assess-loan-risk (loan-id uint) (credit-score uint) (loan-amount uint) (loan-term uint))
-  (let (
-    (interest-rate (calculate-interest-rate credit-score loan-amount loan-term))
-    (risk-score (- u1000 (/ (* credit-score u1000) u1000)))
-  )
-    (begin
-      (asserts! (is-eq tx-sender contract-owner) (err u403)) ;; Only owner can assess risk
-      (map-set loan-risk-profiles loan-id {
-        interest-rate: interest-rate,
-        risk-score: risk-score,
-        loan-term: loan-term
-      })
-      (ok interest-rate)
+(define-read-only (calculate-remaining-balance (loan-id uint))
+  (match (get-loan loan-id)
+    loan (let (
+      (principal-with-interest (+ (get amount loan) (/ (* (get amount loan) (get interest-rate loan) (get term loan)) u1200)))
+      (total-repaid (get total-repaid loan))
     )
+      (- principal-with-interest total-repaid))
+    u0
   )
 )
 
-(define-public (update-risk-profile (loan-id uint) (new-interest-rate uint) (new-risk-score uint))
-  (match (get-risk-profile loan-id)
-    profile (begin
-      (asserts! (is-eq tx-sender contract-owner) (err u403)) ;; Only owner can update
-      (map-set loan-risk-profiles loan-id (merge profile {
-        interest-rate: new-interest-rate,
-        risk-score: new-risk-score
-      }))
+(define-public (create-loan (loan-id uint) (borrower principal) (amount uint) (interest-rate uint) (term uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) (err u403)) ;; Only owner can create loans
+    (asserts! (is-none (get-loan loan-id)) (err u1)) ;; Loan ID already exists
+    (map-set loans loan-id {
+      borrower: borrower,
+      amount: amount,
+      interest-rate: interest-rate,
+      term: term,
+      start-block: block-height,
+      end-block: (+ block-height (* term u144)), ;; ~144 blocks per day
+      total-repaid: u0,
+      status: "active"
+    })
+    (ok true)
+  )
+)
+
+(define-public (make-repayment (loan-id uint) (amount uint))
+  (match (get-loan loan-id)
+    loan (let (
+      (payment-id (var-get next-payment-id))
+      (new-total-repaid (+ (get total-repaid loan) amount))
+      (remaining (calculate-remaining-balance loan-id))
+    )
+      (begin
+        (asserts! (is-eq tx-sender (get borrower loan)) (err u2)) ;; Not the borrower
+        (asserts! (is-eq (get status loan) "active") (err u3)) ;; Loan not active
+        (asserts! (> amount u0) (err u4)) ;; Amount must be positive
+
+        ;; Record the payment
+        (map-set repayments {loan-id: loan-id, payment-id: payment-id} {
+          amount: amount,
+          block-height: block-height
+        })
+        (var-set next-payment-id (+ payment-id u1))
+
+        ;; Update loan with new total repaid
+        (map-set loans loan-id (merge loan {
+          total-repaid: new-total-repaid,
+          status: (if (>= new-total-repaid (+ (get amount loan) (/ (* (get amount loan) (get interest-rate loan) (get term loan)) u1200)))
+                    "completed"
+                    "active")
+        }))
+
+        (ok true)
+      ))
+    (err u5) ;; Loan not found
+  )
+)
+
+(define-public (mark-loan-defaulted (loan-id uint))
+  (match (get-loan loan-id)
+    loan (begin
+      (asserts! (is-eq tx-sender contract-owner) (err u403)) ;; Only owner can mark default
+      (asserts! (is-eq (get status loan) "active") (err u3)) ;; Loan not active
+      (asserts! (> block-height (get end-block loan)) (err u6)) ;; Loan not yet expired
+
+      ;; Mark as defaulted
+      (map-set loans loan-id (merge loan { status: "defaulted" }))
       (ok true)
     )
-    (err u1) ;; Profile not found
+    (err u5) ;; Loan not found
   )
 )
